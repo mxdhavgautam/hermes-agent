@@ -309,8 +309,15 @@ class TestRecentSessionListing:
 # =========================================================================
 
 class TestSessionSearch:
-    def test_no_db_returns_error(self):
+    def test_no_db_returns_error(self, monkeypatch):
+        import hermes_state
         from tools.session_search_tool import session_search
+
+        class _BrokenSessionDB:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError("db unavailable")
+
+        monkeypatch.setattr(hermes_state, "SessionDB", _BrokenSessionDB)
         result = json.loads(session_search(query="test"))
         assert result["success"] is False
         assert "not available" in result["error"].lower()

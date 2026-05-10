@@ -2916,6 +2916,11 @@ class BasePlatformAdapter(ABC):
                         if event.source.platform == Platform.FEISHU and event.source.thread_id and event.reply_to_message_id
                         else event.message_id
                     )
+                    if _thread_metadata is not None:
+                        _thread_metadata = dict(_thread_metadata)
+                        _thread_metadata["notify"] = True
+                    else:
+                        _thread_metadata = {"notify": True}
                     result = await self._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,

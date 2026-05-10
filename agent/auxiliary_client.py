@@ -1823,13 +1823,15 @@ def _is_connection_error(exc: Exception) -> bool:
     distinct from API errors (4xx/5xx) which indicate the provider IS
     reachable but returned an error.
     """
-    from openai import APIConnectionError, APITimeoutError
-
-    if isinstance(exc, (APIConnectionError, APITimeoutError)):
-        return True
+    try:
+        from openai import APIConnectionError, APITimeoutError
+        if isinstance(exc, (APIConnectionError, APITimeoutError)):
+            return True
+    except ImportError:
+        pass
     # urllib3 / httpx / httpcore connection errors
     err_type = type(exc).__name__
-    if any(kw in err_type for kw in ("Connection", "Timeout", "DNS", "SSL", "RemoteProtocol")):
+    if any(kw in err_type for kw in ("Connection", "Timeout", "DNS", "SSL", "RemoteProtocol", "LocalProtocol")):
         return True
     err_lower = str(exc).lower()
     if any(kw in err_lower for kw in (
@@ -1839,9 +1841,12 @@ def _is_connection_error(exc: Exception) -> bool:
         "peer closed connection",
         "incomplete chunked read",
         "complete message body",
+        "response ended prematurely",
         "unexpected eof",
         "server disconnected",
         "client has been closed",
+        "remoteprotocolerror",
+        "localprotocolerror",
     )):
         return True
     return False

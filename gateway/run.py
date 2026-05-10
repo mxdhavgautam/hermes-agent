@@ -3594,10 +3594,6 @@ class GatewayRunner:
                         except Exception:
                             continue
                         try:
-                            try:
-                                _kb.init_db(board=slug)  # idempotent; handles first-run
-                            except Exception:
-                                pass
                             subs = _kb.list_notify_subs(conn)
                             for sub in subs:
                                 cursor, events = _kb.unseen_events_for_sub(
@@ -3890,10 +3886,6 @@ class GatewayRunner:
             conn = None
             try:
                 conn = _kb.connect(board=slug)
-                try:
-                    _kb.init_db(board=slug)  # idempotent, handles first-run
-                except Exception:
-                    pass
                 return _kb.dispatch_once(
                     conn,
                     board=slug,
@@ -4440,7 +4432,26 @@ class GatewayRunner:
             if not check_telegram_requirements():
                 logger.warning("Telegram: python-telegram-bot not installed")
                 return None
-            return TelegramAdapter(config)
+            adapter = TelegramAdapter(config)
+            _notify_mode = os.getenv("HERMES_TELEGRAM_NOTIFICATIONS", "")
+            if not _notify_mode:
+                try:
+                    _gw_cfg = _load_gateway_config()
+                    _raw = cfg_get(_gw_cfg, "display", "platforms", "telegram", "notifications")
+                    if _raw not in (None, ""):
+                        _notify_mode = str(_raw).strip().lower()
+                except Exception:
+                    pass
+            _notify_mode = _notify_mode or "important"
+            if _notify_mode not in ("all", "important"):
+                logger.warning(
+                    "Unknown telegram notifications mode '%s', "
+                    "defaulting to 'important' (valid: all, important)",
+                    _notify_mode,
+                )
+                _notify_mode = "important"
+            adapter._notifications_mode = _notify_mode
+            return adapter
         
         elif platform == Platform.DISCORD:
             from gateway.platforms.discord import DiscordAdapter, check_discord_requirements

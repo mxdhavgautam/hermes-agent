@@ -23,7 +23,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from agent.auxiliary_client import call_llm
+from agent.auxiliary_client import call_llm, _is_connection_error
 from agent.context_engine import ContextEngine
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -961,6 +961,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 isinstance(e, json.JSONDecodeError)
                 or "expecting value" in _err_str
             )
+            _is_streaming_closed = _is_connection_error(e)
             if _is_json_decode and not _is_model_not_found and not _is_timeout:
                 logger.error(
                     "Context compression failed: auxiliary LLM returned a "
@@ -973,7 +974,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                     e,
                 )
             if (
-                (_is_model_not_found or _is_timeout or _is_json_decode)
+                (_is_model_not_found or _is_timeout or _is_json_decode or _is_streaming_closed)
                 and self.summary_model
                 and self.summary_model != self.model
                 and not getattr(self, "_summary_model_fallen_back", False)
@@ -982,6 +983,8 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                     _reason = "returned invalid JSON"
                 elif _is_model_not_found:
                     _reason = "unavailable"
+                elif _is_streaming_closed:
+                    _reason = "closed stream prematurely"
                 else:
                     _reason = "timed out"
                 self._fallback_to_main_for_compression(e, _reason)
@@ -1007,7 +1010,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             # Transient errors (timeout, rate limit, network, JSON decode) —
             # shorter cooldown for JSON decode since the body shape can flip
             # back to valid quickly when an upstream proxy recovers.
-            _transient_cooldown = 30 if _is_json_decode else 60
+            _transient_cooldown = 30 if (_is_json_decode or _is_streaming_closed) else 60
             self._summary_failure_cooldown_until = time.monotonic() + _transient_cooldown
             err_text = str(e).strip() or e.__class__.__name__
             if len(err_text) > 220:

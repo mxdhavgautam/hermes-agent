@@ -305,6 +305,30 @@ class TelegramAdapter(BasePlatformAdapter):
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
+        # Notification mode for message sends.
+        # "important" — only final responses, approvals, and slash confirmations
+        #               trigger notifications; tool progress, streaming, status
+        #               messages are delivered silently via disable_notification.
+        #               This is the default — Telegram users found per-tool-call
+        #               push notifications too noisy.
+        # "all"       — every message triggers a push notification (legacy
+        #               behavior; opt-in via display.platforms.telegram.notifications).
+        self._notifications_mode: str = "important"
+
+    def _notification_kwargs(
+        self, metadata: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Return disable_notification kwargs when the adapter is in silent mode.
+
+        In "important" mode, all message sends are silently delivered
+        (disable_notification=True) unless the caller explicitly requests a
+        notification by setting ``metadata["notify"] = True``.
+        """
+        if getattr(self, "_notifications_mode", "important") != "important":
+            return {}
+        if (metadata or {}).get("notify"):
+            return {}
+        return {"disable_notification": True}
 
     def _is_callback_user_authorized(
         self,
@@ -1270,6 +1294,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 reply_to_message_id=reply_to_id,
                                 message_thread_id=effective_thread_id,
                                 **self._link_preview_kwargs(),
+                            **self._notification_kwargs(metadata),
                             )
                         except Exception as md_error:
                             # Markdown parsing failed, try plain text
@@ -1283,6 +1308,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     reply_to_message_id=reply_to_id,
                                     message_thread_id=effective_thread_id,
                                     **self._link_preview_kwargs(),
+                                    **self._notification_kwargs(metadata),
                                 )
                             else:
                                 raise
@@ -1510,6 +1536,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_markup=keyboard,
                 message_thread_id=message_thread_id,
                 **self._link_preview_kwargs(),
+                **self._notification_kwargs(metadata),
             )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -1565,6 +1592,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "parse_mode": ParseMode.HTML,
                 "reply_markup": keyboard,
                 **self._link_preview_kwargs(),
+                **self._notification_kwargs(metadata),
             }
             message_thread_id = self._message_thread_id_for_send(thread_id)
             if message_thread_id is not None:
@@ -1610,6 +1638,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "parse_mode": ParseMode.MARKDOWN,
                 "reply_markup": keyboard,
                 **self._link_preview_kwargs(),
+                **self._notification_kwargs(metadata),
             }
             message_thread_id = self._message_thread_id_for_send(thread_id)
             if message_thread_id is not None:
@@ -1679,6 +1708,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_markup=keyboard,
                 message_thread_id=int(thread_id) if thread_id else None,
                 **self._link_preview_kwargs(),
+                **self._notification_kwargs(metadata),
             )
 
             # Store picker state keyed by chat_id
@@ -2062,6 +2092,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             "text": result_text,
                             "parse_mode": ParseMode.MARKDOWN,
                             **self._link_preview_kwargs(),
+                            **self._notification_kwargs({"notify": True}),
                         }
                         if thread_id is not None:
                             send_kwargs["message_thread_id"] = thread_id
@@ -2151,6 +2182,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         caption=caption[:1024] if caption else None,
                         reply_to_message_id=int(reply_to) if reply_to else None,
                         message_thread_id=self._message_thread_id_for_send(_voice_thread),
+                        **self._notification_kwargs(metadata),
                     )
                 elif ext in (".mp3", ".m4a"):
                     # Telegram's Bot API sendAudio only accepts MP3 / M4A.
@@ -2161,6 +2193,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         caption=caption[:1024] if caption else None,
                         reply_to_message_id=int(reply_to) if reply_to else None,
                         message_thread_id=self._message_thread_id_for_send(_audio_thread),
+                        **self._notification_kwargs(metadata),
                     )
                 else:
                     # Formats Telegram can't play natively (.wav, .flac, ...)
@@ -2275,6 +2308,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id=int(chat_id),
                     media=media,
                     message_thread_id=_thread_id,
+                    **self._notification_kwargs(metadata),
                 )
             except Exception as e:
                 logger.warning(
@@ -2318,6 +2352,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     caption=caption[:1024] if caption else None,
                     reply_to_message_id=int(reply_to) if reply_to else None,
                     message_thread_id=self._message_thread_id_for_send(_thread),
+                    **self._notification_kwargs(metadata),
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -2399,6 +2434,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     caption=caption[:1024] if caption else None,
                     reply_to_message_id=int(reply_to) if reply_to else None,
                     message_thread_id=self._message_thread_id_for_send(_thread),
+                    **self._notification_kwargs(metadata),
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -2430,6 +2466,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     caption=caption[:1024] if caption else None,
                     reply_to_message_id=int(reply_to) if reply_to else None,
                     message_thread_id=self._message_thread_id_for_send(_thread),
+                    **self._notification_kwargs(metadata),
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -2466,6 +2503,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 caption=caption[:1024] if caption else None,  # Telegram caption limit
                 reply_to_message_id=int(reply_to) if reply_to else None,
                 message_thread_id=self._message_thread_id_for_send(_photo_thread),
+                **self._notification_kwargs(metadata),
             )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
