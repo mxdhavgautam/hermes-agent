@@ -862,11 +862,17 @@ class AsyncCodexAuxiliaryClient:
     """Async-compatible wrapper matching AsyncOpenAI.chat.completions.create()."""
 
     def __init__(self, sync_wrapper: "CodexAuxiliaryClient"):
+        self._sync_wrapper = sync_wrapper
         sync_adapter = sync_wrapper.chat.completions
         async_adapter = _AsyncCodexCompletionsAdapter(sync_adapter)
         self.chat = _AsyncCodexChatShim(async_adapter)
         self.api_key = sync_wrapper.api_key
         self.base_url = sync_wrapper.base_url
+
+    def close(self):
+        close_fn = getattr(self._sync_wrapper, "close", None)
+        if callable(close_fn):
+            close_fn()
 
 
 class _AnthropicCompletionsAdapter:
@@ -1823,13 +1829,19 @@ def _is_connection_error(exc: Exception) -> bool:
         return True
     # urllib3 / httpx / httpcore connection errors
     err_type = type(exc).__name__
-    if any(kw in err_type for kw in ("Connection", "Timeout", "DNS", "SSL")):
+    if any(kw in err_type for kw in ("Connection", "Timeout", "DNS", "SSL", "RemoteProtocol")):
         return True
     err_lower = str(exc).lower()
     if any(kw in err_lower for kw in (
         "connection refused", "name or service not known",
         "no route to host", "network is unreachable",
         "timed out", "connection reset",
+        "peer closed connection",
+        "incomplete chunked read",
+        "complete message body",
+        "unexpected eof",
+        "server disconnected",
+        "client has been closed",
     )):
         return True
     return False
@@ -3111,6 +3123,40 @@ def _force_close_async_httpx(client: Any) -> None:
         pass
 
 
+def _is_sync_client_closed(client: Any) -> bool:
+    """Best-effort detection for closed sync clients cached by auxiliary_client.
+
+    The Codex auxiliary wrapper stores the real OpenAI client on ``_real_client``.
+    Plain OpenAI clients store the underlying httpx client on ``_client``.
+    Inspect both shapes so a timeout-closed cached sync client is rebuilt on the
+    next cache hit instead of being reused.
+    """
+    try:
+        candidates = [client]
+        seen: set[int] = set()
+        index = 0
+        while index < len(candidates):
+            obj = candidates[index]
+            index += 1
+            if obj is None:
+                continue
+            obj_id = id(obj)
+            if obj_id in seen:
+                continue
+            seen.add(obj_id)
+            for attr in ("_sync_wrapper", "_sync", "_real_client", "_client", "chat", "completions"):
+                nested = getattr(obj, attr, None)
+                if nested is not None:
+                    candidates.append(nested)
+            if hasattr(obj, "is_closed"):
+                is_closed = getattr(obj, "is_closed")
+                if isinstance(is_closed, bool):
+                    return is_closed
+        return False
+    except Exception:
+        return False
+
+
 def shutdown_cached_clients() -> None:
     """Close all cached clients (sync and async) to prevent event-loop errors.
 
@@ -3233,22 +3279,39 @@ def _get_cached_client(
             cached_client, cached_default, cached_loop = _client_cache[cache_key]
             if async_mode:
                 # Validate: the cached client must be bound to the CURRENT,
-                # OPEN loop.  If the loop changed or was closed, the httpx
-                # transport inside is dead — force-close and replace.
+                # OPEN loop. Some async wrappers (notably Codex) delegate to a
+                # sync client under the hood, so the loop can still be valid
+                # even when the wrapped sync transport was already closed by a
+                # timeout path. Evict either kind of stale entry.
                 loop_ok = (
                     cached_loop is not None
                     and cached_loop is current_loop
                     and not cached_loop.is_closed()
                 )
-                if loop_ok:
+                if loop_ok and not _is_sync_client_closed(cached_client):
                     effective = _compat_model(cached_client, model, cached_default)
                     return cached_client, effective
                 # Stale — evict and fall through to create a new client.
                 _force_close_async_httpx(cached_client)
+                try:
+                    close_fn = getattr(cached_client, "close", None)
+                    if callable(close_fn):
+                        close_fn()
+                except Exception:
+                    logger.debug("Auxiliary cache: async client close during eviction failed", exc_info=True)
                 del _client_cache[cache_key]
             else:
-                effective = _compat_model(cached_client, model, cached_default)
-                return cached_client, effective
+                if _is_sync_client_closed(cached_client):
+                    try:
+                        close_fn = getattr(cached_client, "close", None)
+                        if callable(close_fn):
+                            close_fn()
+                    except Exception:
+                        logger.debug("Auxiliary cache: sync client close during eviction failed", exc_info=True)
+                    del _client_cache[cache_key]
+                else:
+                    effective = _compat_model(cached_client, model, cached_default)
+                    return cached_client, effective
     # Build outside the lock
     client, default_model = resolve_provider_client(
         provider,
@@ -3819,6 +3882,42 @@ def call_llm(
                     return _validate_llm_response(
                         retry_client.chat.completions.create(**retry_kwargs), task)
 
+        # ── Same-provider rebuild + retry for transient connection errors ──
+        # This matters even when no alternate fallback provider is configured:
+        # transport hiccups like incomplete chunked reads often succeed on a
+        # fresh client immediately afterwards.
+        if task != "vision" and _is_connection_error(first_err):
+            logger.info(
+                "Auxiliary %s: transient connection error on %s (%s), "
+                "rebuilding client and retrying once",
+                task or "call",
+                resolved_provider or "auto",
+                first_err,
+            )
+            _evict_cached_clients(resolved_provider or "auto")
+            retry_client, retry_model = _get_cached_client(
+                resolved_provider,
+                resolved_model,
+                base_url=resolved_base_url,
+                api_key=resolved_api_key,
+                api_mode=resolved_api_mode,
+                main_runtime=main_runtime,
+            )
+            if retry_client is not None:
+                retry_kwargs = dict(kwargs)
+                if retry_model and retry_model != retry_kwargs.get("model"):
+                    retry_kwargs["model"] = retry_model
+                _retry_base = str(getattr(retry_client, "base_url", "") or "")
+                if _is_anthropic_compat_endpoint(resolved_provider, _retry_base):
+                    retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
+                try:
+                    return _validate_llm_response(
+                        retry_client.chat.completions.create(**retry_kwargs), task)
+                except Exception as retry_err:
+                    first_err = retry_err
+                    client = retry_client
+                    kwargs = retry_kwargs
+
         # ── Payment / credit exhaustion fallback ──────────────────────
         # When the resolved provider returns 402 or a credit-related error,
         # try alternative providers instead of giving up.  This handles the
@@ -4132,6 +4231,39 @@ async def async_call_llm(
                         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
                     return _validate_llm_response(
                         await retry_client.chat.completions.create(**retry_kwargs), task)
+
+        # ── Same-provider rebuild + retry for transient connection errors ──
+        if task != "vision" and _is_connection_error(first_err):
+            logger.info(
+                "Auxiliary %s (async): transient connection error on %s (%s), "
+                "rebuilding client and retrying once",
+                task or "call",
+                resolved_provider or "auto",
+                first_err,
+            )
+            _evict_cached_clients(resolved_provider or "auto")
+            retry_client, retry_model = _get_cached_client(
+                resolved_provider,
+                resolved_model,
+                async_mode=True,
+                base_url=resolved_base_url,
+                api_key=resolved_api_key,
+                api_mode=resolved_api_mode,
+            )
+            if retry_client is not None:
+                retry_kwargs = dict(kwargs)
+                if retry_model and retry_model != retry_kwargs.get("model"):
+                    retry_kwargs["model"] = retry_model
+                _retry_base = str(getattr(retry_client, "base_url", "") or "")
+                if _is_anthropic_compat_endpoint(resolved_provider, _retry_base):
+                    retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
+                try:
+                    return _validate_llm_response(
+                        await retry_client.chat.completions.create(**retry_kwargs), task)
+                except Exception as retry_err:
+                    first_err = retry_err
+                    client = retry_client
+                    kwargs = retry_kwargs
 
         # ── Payment / connection / rate-limit fallback (mirrors sync call_llm) ──
         should_fallback = (

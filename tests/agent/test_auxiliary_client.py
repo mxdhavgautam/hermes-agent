@@ -1,5 +1,6 @@
 """Tests for agent.auxiliary_client resolution chain, provider overrides, and model overrides."""
 
+import asyncio
 import json
 import logging
 import os
@@ -763,6 +764,169 @@ class TestAuxiliaryPoolAwareness:
         assert model == "openai/gpt-5.4-mini"
         assert mock_resolve.call_count == 1
 
+    def test_sync_cached_codex_client_is_rebuilt_when_closed(self):
+        import agent.auxiliary_client as aux
+
+        stale_real = SimpleNamespace(
+            api_key="codex-key",
+            base_url="https://chatgpt.com/backend-api/codex/",
+            _client=SimpleNamespace(is_closed=True),
+            close=lambda: None,
+        )
+        fresh_real = SimpleNamespace(
+            api_key="codex-key",
+            base_url="https://chatgpt.com/backend-api/codex/",
+            _client=SimpleNamespace(is_closed=False),
+            close=lambda: None,
+        )
+        stale_client = aux.CodexAuxiliaryClient(stale_real, "gpt-5.4")
+        fresh_client = aux.CodexAuxiliaryClient(fresh_real, "gpt-5.4")
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=[(stale_client, "gpt-5.4"), (fresh_client, "gpt-5.4")],
+        ) as mock_resolve:
+            aux.shutdown_cached_clients()
+            try:
+                client, model = aux._get_cached_client("auto", "gpt-5.4")
+                assert client is stale_client
+                assert model == "gpt-5.4"
+
+                client, model = aux._get_cached_client("auto", "gpt-5.4")
+            finally:
+                aux.shutdown_cached_clients()
+
+        assert client is fresh_client
+        assert model == "gpt-5.4"
+        assert mock_resolve.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_async_cached_codex_client_is_rebuilt_when_inner_sync_client_closed(self):
+        import agent.auxiliary_client as aux
+
+        stale_real = SimpleNamespace(
+            api_key="codex-key",
+            base_url="https://chatgpt.com/backend-api/codex/",
+            _client=SimpleNamespace(is_closed=True),
+            close=lambda: None,
+        )
+        fresh_real = SimpleNamespace(
+            api_key="codex-key",
+            base_url="https://chatgpt.com/backend-api/codex/",
+            _client=SimpleNamespace(is_closed=False),
+            close=lambda: None,
+        )
+        stale_async = aux.AsyncCodexAuxiliaryClient(aux.CodexAuxiliaryClient(stale_real, "gpt-5.4"))
+        fresh_async = aux.AsyncCodexAuxiliaryClient(aux.CodexAuxiliaryClient(fresh_real, "gpt-5.4"))
+
+        aux.shutdown_cached_clients()
+        try:
+            cache_key = aux._client_cache_key(
+                "auto",
+                async_mode=True,
+                base_url=None,
+                api_key=None,
+                api_mode=None,
+                main_runtime=None,
+                is_vision=False,
+            )
+            with aux._client_cache_lock:
+                aux._client_cache[cache_key] = (
+                    stale_async,
+                    "gpt-5.4",
+                    asyncio.get_running_loop(),
+                )
+            with patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(fresh_async, "gpt-5.4"),
+            ) as mock_resolve:
+                client, model = aux._get_cached_client("auto", "gpt-5.4", async_mode=True)
+        finally:
+            aux.shutdown_cached_clients()
+
+        assert client is fresh_async
+        assert model == "gpt-5.4"
+        assert mock_resolve.call_count == 1
+
+    def test_call_llm_retries_same_provider_once_on_chunked_read(self):
+        class _ChunkedReadError(Exception):
+            pass
+
+        stale_client = MagicMock()
+        stale_client.base_url = "https://chatgpt.com/backend-api/codex/"
+        stale_client.chat.completions.create.side_effect = _ChunkedReadError(
+            "peer closed connection without sending complete message body "
+            "(incomplete chunked read)"
+        )
+
+        fresh_client = MagicMock()
+        fresh_client.base_url = "https://chatgpt.com/backend-api/codex/"
+        fresh_client.chat.completions.create.return_value = {"ok": True}
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("auto", "gpt-5.4", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                side_effect=[(stale_client, "gpt-5.4"), (fresh_client, "gpt-5.4")],
+            ) as mock_get_cached,
+            patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda resp, _task: resp),
+            patch("agent.auxiliary_client._evict_cached_clients") as mock_evict,
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+        assert result == {"ok": True}
+        assert stale_client.chat.completions.create.call_count == 1
+        assert fresh_client.chat.completions.create.call_count == 1
+        mock_evict.assert_called_once_with("auto")
+        assert mock_get_cached.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_async_call_llm_retries_same_provider_once_on_chunked_read(self):
+        class _ChunkedReadError(Exception):
+            pass
+
+        stale_client = MagicMock()
+        stale_client.base_url = "https://chatgpt.com/backend-api/codex/"
+        stale_client.chat.completions.create = AsyncMock(
+            side_effect=_ChunkedReadError(
+                "peer closed connection without sending complete message body "
+                "(incomplete chunked read)"
+            )
+        )
+
+        fresh_client = MagicMock()
+        fresh_client.base_url = "https://chatgpt.com/backend-api/codex/"
+        fresh_client.chat.completions.create = AsyncMock(return_value={"ok": True})
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("auto", "gpt-5.4", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                side_effect=[(stale_client, "gpt-5.4"), (fresh_client, "gpt-5.4")],
+            ) as mock_get_cached,
+            patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda resp, _task: resp),
+            patch("agent.auxiliary_client._evict_cached_clients") as mock_evict,
+        ):
+            result = await async_call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+        assert result == {"ok": True}
+        assert stale_client.chat.completions.create.await_count == 1
+        assert fresh_client.chat.completions.create.await_count == 1
+        mock_evict.assert_called_once_with("auto")
+        assert mock_get_cached.call_count == 2
+
 
 # ── Payment / credit exhaustion fallback ─────────────────────────────────
 
@@ -1065,6 +1229,14 @@ class TestIsConnectionError:
     def test_dns_failure(self):
         from agent.auxiliary_client import _is_connection_error
         err = Exception("Name or service not known")
+        assert _is_connection_error(err) is True
+
+    def test_incomplete_chunked_read(self):
+        from agent.auxiliary_client import _is_connection_error
+        err = Exception(
+            "peer closed connection without sending complete message body "
+            "(incomplete chunked read)"
+        )
         assert _is_connection_error(err) is True
 
     def test_normal_api_error_not_connection(self):
