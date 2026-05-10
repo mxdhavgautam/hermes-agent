@@ -224,8 +224,7 @@ class TestBuildJobPromptWithScript:
             "script": str(script),
         }
         prompt = _build_job_prompt(job)
-        assert "no output" in prompt.lower()
-        assert "Check status." in prompt
+        assert prompt is None
 
 
 class TestCronjobToolScript:
@@ -298,6 +297,62 @@ class TestCronjobToolScript:
         assert list_result["success"] is True
         assert len(list_result["jobs"]) == 1
         assert list_result["jobs"][0]["script"] == "data_collector.py"
+
+    def test_create_with_absolute_script_inside_scripts_dir_normalized(self, cron_env, monkeypatch):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        from tools.cronjob_tools import cronjob
+
+        script = cron_env / "scripts" / "nested" / "monitor.py"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text('print("ok")\n')
+
+        result = json.loads(cronjob(
+            action="create",
+            schedule="every 1h",
+            prompt="Monitor things",
+            script=str(script),
+        ))
+        assert result["success"] is True
+        assert result["job"]["script"] == "nested/monitor.py"
+
+    def test_update_with_display_tilde_script_inside_scripts_dir_normalized(self, cron_env, monkeypatch):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        from tools.cronjob_tools import cronjob
+
+        create_result = json.loads(cronjob(
+            action="create",
+            schedule="every 1h",
+            prompt="Monitor things",
+        ))
+        job_id = create_result["job_id"]
+
+        nested = cron_env / "scripts" / "nested" / "watcher.sh"
+        nested.parent.mkdir(parents=True, exist_ok=True)
+        nested.write_text('echo watcher\n')
+
+        update_result = json.loads(cronjob(
+            action="update",
+            job_id=job_id,
+            script="~/.hermes/scripts/nested/watcher.sh",
+        ))
+        assert update_result["success"] is True
+        assert update_result["job"]["script"] == "nested/watcher.sh"
+
+    def test_create_with_absolute_script_outside_scripts_dir_still_blocked(self, cron_env, monkeypatch):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        from tools.cronjob_tools import cronjob
+
+        outside = cron_env / "outside.py"
+        outside.write_text('print("nope")\n')
+
+        result = json.loads(cronjob(
+            action="create",
+            schedule="every 1h",
+            prompt="Monitor things",
+            script=str(outside),
+        ))
+        assert result["success"] is False
+        assert "outside" in result["error"].lower() or "place scripts" in result["error"].lower()
 
 
 class TestScriptPathContainment:
@@ -422,7 +477,7 @@ class TestCronjobToolScriptValidation:
             script="/home/user/evil.py",
         ))
         assert result["success"] is False
-        assert "relative" in result["error"].lower() or "absolute" in result["error"].lower()
+        assert "outside" in result["error"].lower() or "place scripts" in result["error"].lower()
 
     def test_create_with_tilde_script_rejected(self, cron_env, monkeypatch):
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
@@ -435,7 +490,7 @@ class TestCronjobToolScriptValidation:
             script="~/monitor.py",
         ))
         assert result["success"] is False
-        assert "relative" in result["error"].lower() or "absolute" in result["error"].lower()
+        assert "outside" in result["error"].lower() or "place scripts" in result["error"].lower()
 
     def test_create_with_traversal_script_rejected(self, cron_env, monkeypatch):
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
@@ -480,7 +535,7 @@ class TestCronjobToolScriptValidation:
             script="/tmp/evil.py",
         ))
         assert update_result["success"] is False
-        assert "relative" in update_result["error"].lower() or "absolute" in update_result["error"].lower()
+        assert "outside" in update_result["error"].lower() or "place scripts" in update_result["error"].lower()
 
     def test_update_clear_script_allowed(self, cron_env, monkeypatch):
         """Clearing a script (empty string) should always be permitted."""

@@ -180,43 +180,60 @@ def _normalize_deliver_param(value: Any) -> Optional[str]:
     return text or None
 
 
-def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
-    """Validate a cron job script path at the API boundary.
+def _normalize_cron_script_path(script: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Normalize a cron job script path at the API boundary.
 
-    Scripts must be relative paths that resolve within HERMES_HOME/scripts/.
-    Absolute paths and ~ expansion are rejected to prevent arbitrary script
-    execution via prompt injection.
+    Accepts:
+    - relative paths, resolved under HERMES_HOME/scripts/
+    - absolute paths that resolve within HERMES_HOME/scripts/
+    - ``~/.hermes/scripts/...`` display paths, normalized against the active
+      HERMES_HOME/scripts/ even when subprocess HOME differs
 
-    Returns an error string if blocked, else None (valid).
+    Returns ``(normalized_relative_path, None)`` when valid, where the stored
+    path is always relative to ``HERMES_HOME/scripts/``. Returns
+    ``(None, error_message)`` when blocked.
     """
     if not script or not script.strip():
-        return None  # empty/None = clearing the field, always OK
+        return None, None  # empty/None = clearing the field, always OK
 
-    from hermes_constants import get_hermes_home
+    from hermes_constants import display_hermes_home, get_hermes_home
 
     raw = script.strip()
-
-    # Reject absolute paths and ~ expansion at the API boundary.
-    # Only relative paths within ~/.hermes/scripts/ are allowed.
-    if raw.startswith(("/", "~")) or (len(raw) >= 2 and raw[1] == ":"):
-        return (
-            f"Script path must be relative to ~/.hermes/scripts/. "
-            f"Got absolute or home-relative path: {raw!r}. "
-            f"Place scripts in ~/.hermes/scripts/ and use just the filename."
-        )
-
-    # Validate containment after resolution
-    from tools.path_security import validate_within_dir
-
     scripts_dir = get_hermes_home() / "scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
-    containment_error = validate_within_dir(scripts_dir / raw, scripts_dir)
-    if containment_error:
-        return (
-            f"Script path escapes the scripts directory via traversal: {raw!r}"
+    scripts_dir_resolved = scripts_dir.resolve()
+
+    windows_abs = len(raw) >= 2 and raw[1] == ":"
+    display_prefix = "~/.hermes/scripts"
+    if raw == display_prefix or raw.startswith(display_prefix + "/"):
+        suffix = raw[len(display_prefix):].lstrip("/")
+        candidate = scripts_dir / suffix
+    else:
+        path_obj = Path(raw).expanduser()
+        if path_obj.is_absolute() or windows_abs:
+            candidate = path_obj
+        else:
+            candidate = scripts_dir / path_obj
+
+    try:
+        resolved = candidate.resolve()
+        relative = resolved.relative_to(scripts_dir_resolved)
+    except ValueError:
+        return None, (
+            f"Script path resolves outside {display_hermes_home()}/scripts/: "
+            f"{raw!r}. Place scripts there or pass a path inside that directory."
+        )
+    except OSError as e:
+        return None, f"Invalid script path {raw!r}: {e}"
+
+    normalized = relative.as_posix().strip()
+    if not normalized or normalized == ".":
+        return None, (
+            f"Script path must point to a file under {display_hermes_home()}/scripts/, "
+            f"not the scripts directory itself: {raw!r}"
         )
 
-    return None
+    return normalized, None
 
 
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -307,9 +324,9 @@ def cronjob(
                 if scan_error:
                     return tool_error(scan_error, success=False)
 
-            # Validate script path before storing
+            # Validate + normalize script path before storing
             if script:
-                script_error = _validate_cron_script_path(script)
+                script, script_error = _normalize_cron_script_path(script)
                 if script_error:
                     return tool_error(script_error, success=False)
 
@@ -426,7 +443,7 @@ def cronjob(
             if script is not None:
                 # Pass empty string to clear an existing script
                 if script:
-                    script_error = _validate_cron_script_path(script)
+                    script, script_error = _normalize_cron_script_path(script)
                     if script_error:
                         return tool_error(script_error, success=False)
                 updates["script"] = _normalize_optional_job_value(script) if script else None
