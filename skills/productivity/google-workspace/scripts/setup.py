@@ -44,14 +44,70 @@ PENDING_AUTH_PATH = HERMES_HOME / "google_oauth_pending.json"
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/contacts.readonly",
-    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
     "https://www.googleapis.com/auth/documents.readonly",
+    "https://www.googleapis.com/auth/presentations.readonly",
+    "https://www.googleapis.com/auth/forms.body.readonly",
+    "https://www.googleapis.com/auth/forms.responses.readonly",
+    "https://www.googleapis.com/auth/meetings.space.readonly",
+    "https://www.googleapis.com/auth/youtube.readonly",
 ]
+
+SERVICE_SCOPES = {
+    "email": ["https://www.googleapis.com/auth/gmail.readonly"],
+    "gmail": ["https://www.googleapis.com/auth/gmail.readonly"],
+    "email_send": ["https://www.googleapis.com/auth/gmail.send"],
+    "email_modify": ["https://www.googleapis.com/auth/gmail.modify"],
+    "calendar": ["https://www.googleapis.com/auth/calendar.readonly"],
+    "calendar_write": ["https://www.googleapis.com/auth/calendar"],
+    "drive": ["https://www.googleapis.com/auth/drive.readonly"],
+    "contacts": ["https://www.googleapis.com/auth/contacts.readonly"],
+    "people": ["https://www.googleapis.com/auth/contacts.readonly"],
+    "sheets": ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+    "sheets_write": ["https://www.googleapis.com/auth/spreadsheets"],
+    "docs": ["https://www.googleapis.com/auth/documents.readonly"],
+    "slides": ["https://www.googleapis.com/auth/presentations.readonly"],
+    "slides_write": ["https://www.googleapis.com/auth/presentations"],
+    "forms": [
+        "https://www.googleapis.com/auth/forms.body.readonly",
+        "https://www.googleapis.com/auth/forms.responses.readonly",
+    ],
+    "forms_write": [
+        "https://www.googleapis.com/auth/forms.body",
+        "https://www.googleapis.com/auth/forms.responses.readonly",
+    ],
+    "meet": ["https://www.googleapis.com/auth/meetings.space.readonly"],
+    "meet_write": [
+        "https://www.googleapis.com/auth/meetings.space.created",
+        "https://www.googleapis.com/auth/meetings.space.settings",
+        "https://www.googleapis.com/auth/meetings.space.readonly",
+    ],
+    "youtube": ["https://www.googleapis.com/auth/youtube.readonly"],
+    "all": SCOPES,
+}
+
+
+def _resolve_scopes(services: str | None = None) -> list[str]:
+    if not services or services == "all":
+        return list(SCOPES)
+    scopes: list[str] = []
+    for raw in services.split(","):
+        name = raw.strip().lower()
+        if not name:
+            continue
+        if name not in SERVICE_SCOPES:
+            print(f"ERROR: Unknown service '{name}'. Known: {', '.join(sorted(SERVICE_SCOPES))}")
+            sys.exit(1)
+        for scope in SERVICE_SCOPES[name]:
+            if scope not in scopes:
+                scopes.append(scope)
+    if not scopes:
+        print("ERROR: No OAuth scopes selected.")
+        sys.exit(1)
+    return scopes
 
 REQUIRED_PACKAGES = ["google-api-python-client", "google-auth-oauthlib", "google-auth-httplib2"]
 
@@ -59,6 +115,8 @@ REQUIRED_PACKAGES = ["google-api-python-client", "google-auth-oauthlib", "google
 # Google deprecated OOB, so we use a localhost redirect and tell the user to
 # copy the code from the browser's URL bar (or the page body).
 REDIRECT_URI = "http://localhost:1"
+LEGACY_AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
+MODERN_AUTH_URI = "https://accounts.google.com/o/oauth2/v2/auth"
 
 
 def _normalize_authorized_user_payload(payload: dict) -> dict:
@@ -68,6 +126,29 @@ def _normalize_authorized_user_payload(payload: dict) -> dict:
     return normalized
 
 
+def _normalize_client_config(data: dict) -> dict:
+    """Normalize saved Google OAuth client config for modern installed-app flows."""
+    normalized = json.loads(json.dumps(data))
+    client_key = "installed" if "installed" in normalized else "web" if "web" in normalized else None
+    if client_key:
+        section = normalized.get(client_key) or {}
+        # Some downloaded Desktop OAuth JSON files still ship the legacy
+        # /o/oauth2/auth endpoint, which Google now rejects for parameters like
+        # access_type=offline in flows that otherwise work with the v2 endpoint.
+        if section.get("auth_uri") == LEGACY_AUTH_URI:
+            section["auth_uri"] = MODERN_AUTH_URI
+    return normalized
+
+
+def _load_client_config() -> dict:
+    try:
+        data = json.loads(CLIENT_SECRET_PATH.read_text())
+    except json.JSONDecodeError:
+        print(f"ERROR: Stored client secret at {CLIENT_SECRET_PATH} is not valid JSON.")
+        sys.exit(1)
+    return _normalize_client_config(data)
+
+
 def _load_token_payload(path: Path = TOKEN_PATH) -> dict:
     try:
         return json.loads(path.read_text())
@@ -75,12 +156,20 @@ def _load_token_payload(path: Path = TOKEN_PATH) -> dict:
         return {}
 
 
-def _missing_scopes_from_payload(payload: dict) -> list[str]:
-    raw = payload.get("scopes") or payload.get("scope")
+def _coerce_scope_set(raw) -> set[str]:
     if not raw:
+        return set()
+    return {s.strip() for s in (raw.split() if isinstance(raw, str) else raw) if s.strip()}
+
+
+def _missing_scopes_from_payload(payload: dict) -> list[str]:
+    granted = _coerce_scope_set(payload.get("scopes") or payload.get("scope"))
+    if not granted:
         return []
-    granted = {s.strip() for s in (raw.split() if isinstance(raw, str) else raw) if s.strip()}
-    return sorted(scope for scope in SCOPES if scope not in granted)
+    # Tokens may intentionally be least-privilege. Compare against the scopes
+    # requested for this token when available, not the broad default SCOPES list.
+    expected = _coerce_scope_set(payload.get("requested_scopes")) or granted
+    return sorted(scope for scope in expected if scope not in granted)
 
 
 def _format_missing_scopes(missing_scopes: list[str]) -> str:
@@ -202,11 +291,12 @@ def store_client_secret(path: str):
         print("Download the correct file from: https://console.cloud.google.com/apis/credentials")
         sys.exit(1)
 
-    CLIENT_SECRET_PATH.write_text(json.dumps(data, indent=2))
+    normalized = _normalize_client_config(data)
+    CLIENT_SECRET_PATH.write_text(json.dumps(normalized, indent=2))
     print(f"OK: Client secret saved to {CLIENT_SECRET_PATH}")
 
 
-def _save_pending_auth(*, state: str, code_verifier: str):
+def _save_pending_auth(*, state: str, code_verifier: str, scopes: list[str]):
     """Persist the OAuth session bits needed for a later token exchange."""
     PENDING_AUTH_PATH.write_text(
         json.dumps(
@@ -214,6 +304,7 @@ def _save_pending_auth(*, state: str, code_verifier: str):
                 "state": state,
                 "code_verifier": code_verifier,
                 "redirect_uri": REDIRECT_URI,
+                "scopes": scopes,
             },
             indent=2,
         )
@@ -258,7 +349,7 @@ def _extract_code_and_state(code_or_url: str) -> tuple[str, str | None]:
     return params["code"][0], state
 
 
-def get_auth_url():
+def get_auth_url(services: str | None = None, output_format: str = "text"):
     """Print the OAuth authorization URL. User visits this in a browser."""
     if not CLIENT_SECRET_PATH.exists():
         print("ERROR: No client secret stored. Run --client-secret first.")
@@ -267,19 +358,24 @@ def get_auth_url():
     _ensure_deps()
     from google_auth_oauthlib.flow import Flow
 
-    flow = Flow.from_client_secrets_file(
-        str(CLIENT_SECRET_PATH),
-        scopes=SCOPES,
+    scopes = _resolve_scopes(services)
+    flow = Flow.from_client_config(
+        _load_client_config(),
+        scopes=scopes,
         redirect_uri=REDIRECT_URI,
         autogenerate_code_verifier=True,
     )
+    # Google has started rejecting `prompt=consent` for some Desktop OAuth flows
+    # with `Error 400: invalid_request` / `Invalid prompt: consent`.
+    # Keep the flow broadly compatible by omitting `prompt` entirely here.
     auth_url, state = flow.authorization_url(
         access_type="offline",
-        prompt="consent",
     )
-    _save_pending_auth(state=state, code_verifier=flow.code_verifier)
-    # Print just the URL so the agent can extract it cleanly
-    print(auth_url)
+    _save_pending_auth(state=state, code_verifier=flow.code_verifier, scopes=scopes)
+    if output_format == "json":
+        print(json.dumps({"auth_url": auth_url, "scopes": scopes}, indent=2))
+    else:
+        print(auth_url)
 
 
 def exchange_auth_code(code: str):
@@ -300,15 +396,15 @@ def exchange_auth_code(code: str):
     from urllib.parse import parse_qs, urlparse
 
     # Extract granted scopes from the callback URL if the user pasted the full redirect URL.
-    granted_scopes = list(SCOPES)
+    granted_scopes = list(pending_auth.get("scopes") or SCOPES)
     if isinstance(raw_callback, str) and raw_callback.startswith("http"):
         params = parse_qs(urlparse(raw_callback).query)
         scope_val = (params.get("scope") or [""])[0].strip()
         if scope_val:
             granted_scopes = scope_val.split()
 
-    flow = Flow.from_client_secrets_file(
-        str(CLIENT_SECRET_PATH),
+    flow = Flow.from_client_config(
+        _load_client_config(),
         scopes=granted_scopes,
         redirect_uri=pending_auth.get("redirect_uri", REDIRECT_URI),
         state=pending_auth["state"],
@@ -336,6 +432,7 @@ def exchange_auth_code(code: str):
     elif granted_scopes != SCOPES:
         # granted_scopes was extracted from the callback URL
         token_payload["scopes"] = granted_scopes
+    token_payload["requested_scopes"] = list(pending_auth.get("scopes") or granted_scopes)
 
     missing_scopes = _missing_scopes_from_payload(token_payload)
     if missing_scopes:
@@ -389,6 +486,8 @@ def main():
     group.add_argument("--auth-code", metavar="CODE", help="Exchange auth code for token")
     group.add_argument("--revoke", action="store_true", help="Revoke and delete stored token")
     group.add_argument("--install-deps", action="store_true", help="Install Python dependencies")
+    parser.add_argument("--services", default="all", help="Comma-separated service set for --auth-url, e.g. email,calendar")
+    parser.add_argument("--format", choices=["text", "json"], default="text", help="Output format for --auth-url")
     args = parser.parse_args()
 
     if args.check:
@@ -396,7 +495,7 @@ def main():
     elif args.client_secret:
         store_client_secret(args.client_secret)
     elif args.auth_url:
-        get_auth_url()
+        get_auth_url(args.services, args.format)
     elif args.auth_code:
         exchange_auth_code(args.auth_code)
     elif args.revoke:

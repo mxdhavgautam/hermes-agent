@@ -89,6 +89,12 @@ class FakeFlow:
         cls.created.append(inst)
         return inst
 
+    @classmethod
+    def from_client_config(cls, client_config, scopes, **kwargs):
+        inst = cls(client_config, scopes, **kwargs)
+        cls.created.append(inst)
+        return inst
+
     def authorization_url(self, **kwargs):
         self.authorization_kwargs = kwargs
         return f"https://auth.example/authorize?state={self.state}", self.state
@@ -145,7 +151,7 @@ class TestGetAuthUrl:
 
         flow = FakeFlow.created[-1]
         assert flow.autogenerate_code_verifier is True
-        assert flow.authorization_kwargs == {"access_type": "offline", "prompt": "consent"}
+        assert flow.authorization_kwargs == {"access_type": "offline"}
 
 
 class TestExchangeAuthCode:
