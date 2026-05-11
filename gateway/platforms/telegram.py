@@ -1666,6 +1666,109 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return False
 
+    def supports_draft_streaming(
+        self,
+        chat_type: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Telegram supports sendMessageDraft for private chats only.
+
+        Bot API 9.5 (March 2026) opened ``sendMessageDraft`` to all bots
+        unconditionally for private (DM) chats.  Groups, supergroups, and
+        channels still rely on the edit-based path.
+
+        We additionally require ``self._bot`` to expose ``send_message_draft``
+        (added to python-telegram-bot in 22.6); older PTB installs gracefully
+        fall back to the edit path even on DMs.
+        """
+        if not self._bot or not hasattr(self._bot, "send_message_draft"):
+            return False
+        return (chat_type or "").lower() in ("dm", "private")
+
+    async def send_draft(
+        self,
+        chat_id: str,
+        draft_id: int,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Stream a partial message via Telegram's native sendMessageDraft.
+
+        The Bot API animates the preview when the same ``draft_id`` is reused
+        across consecutive calls in the same chat.  When the response
+        finishes, the caller sends the final text via the normal ``send``
+        path; the draft preview clears naturally on the client (Telegram has
+        no Bot API to "promote" a draft to a real message — the final
+        ``sendMessage`` is what the user receives in their history).
+        """
+        if not self._bot:
+            return SendResult(success=False, error="not_connected")
+        if not hasattr(self._bot, "send_message_draft"):
+            return SendResult(success=False, error="api_unavailable")
+
+        # Trim to the same UTF-16 budget the platform enforces on regular
+        # sends.  Drafts have the same length contract as messages.
+        text = content if len(content) <= self.MAX_MESSAGE_LENGTH else \
+            self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)[0]
+
+        kwargs: Dict[str, Any] = {
+            "chat_id": int(chat_id),
+            "draft_id": int(draft_id),
+            "text": text,
+        }
+        thread_id = self._metadata_thread_id(metadata)
+        if thread_id is not None:
+            kwargs["message_thread_id"] = thread_id
+
+        try:
+            ok = await self._bot.send_message_draft(**kwargs)
+            if ok:
+                # Drafts have no message_id; we report success without one
+                # so the caller knows the animation frame landed.
+                return SendResult(success=True, message_id=None)
+            return SendResult(success=False, error="draft_rejected")
+        except Exception as e:
+            # Most likely: BadRequest because this bot/chat doesn't allow
+            # drafts, or a transient server hiccup.  The caller treats any
+            # failure as "fall back to edit-based for this response".
+            logger.debug(
+                "[%s] sendMessageDraft failed (chat=%s draft_id=%s): %s",
+                self.name, chat_id, draft_id, e,
+            )
+            return SendResult(success=False, error=str(e))
+
+    async def _send_message_with_thread_fallback(self, **kwargs):
+        """Send a Telegram message, retrying once without message_thread_id
+        if Telegram returns 'Message thread not found'.
+
+        Used for control-style sends (approval prompts, model picker,
+        update prompts) that can carry a stale thread_id from a DM
+        reply chain.  The streaming send loop has its own equivalent
+        (PR #3390) at the body of ``send``; this helper applies the
+        same retry pattern to the non-streaming control paths.
+        """
+        if not self._bot:
+            raise RuntimeError("Not connected")
+
+        message_thread_id = kwargs.get("message_thread_id")
+        try:
+            return await self._bot.send_message(**kwargs)
+        except Exception as send_err:
+            if (
+                message_thread_id is not None
+                and self._is_bad_request_error(send_err)
+                and self._is_thread_not_found_error(send_err)
+            ):
+                logger.warning(
+                    "[%s] Thread %s not found for control message, retrying without message_thread_id",
+                    self.name,
+                    message_thread_id,
+                )
+                retry_kwargs = dict(kwargs)
+                retry_kwargs.pop("message_thread_id", None)
+                return await self._bot.send_message(**retry_kwargs)
+            raise
+
     async def send_update_prompt(
         self, chat_id: str, prompt: str, default: str = "",
         session_key: str = "",
