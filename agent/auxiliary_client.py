@@ -878,7 +878,7 @@ class _CodexCompletionsAdapter:
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or float(total_timeout) < 0.1:
-                    timed_out.set()
+                    _close_client_on_timeout()
                     raise TimeoutError(_timeout_message())
                 # The interrupt hook is best-effort and can be cold-imported.
                 # When the caller sets a tight total timeout, prioritize the
