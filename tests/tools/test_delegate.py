@@ -784,7 +784,9 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["base_url"], "https://openrouter.ai/api/v1")
         self.assertEqual(creds["api_key"], "sk-or-test-key")
         self.assertEqual(creds["api_mode"], "chat_completions")
-        mock_resolve.assert_called_once_with(requested="openrouter")
+        mock_resolve.assert_called_once_with(
+            requested="openrouter", target_model="google/gemini-3-flash-preview"
+        )
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_provider_resolution_uses_runtime_model_when_config_model_missing(self, mock_resolve):
@@ -804,7 +806,7 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["model"], "server-default-model")
         self.assertEqual(creds["provider"], "custom")
         self.assertEqual(creds["base_url"], "https://my-server.example/v1")
-        mock_resolve.assert_called_once_with(requested="custom:my-server")
+        mock_resolve.assert_called_once_with(requested="custom:my-server", target_model=None)
 
     def test_direct_endpoint_uses_configured_base_url_and_api_key(self):
         parent = _make_mock_parent(depth=0)
@@ -868,7 +870,9 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["provider"], "nous")
         self.assertEqual(creds["base_url"], "https://inference-api.nousresearch.com/v1")
         self.assertEqual(creds["api_key"], "nous-agent-key-xyz")
-        mock_resolve.assert_called_once_with(requested="nous")
+        mock_resolve.assert_called_once_with(
+            requested="nous", target_model="hermes-3-llama-3.1-8b"
+        )
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_provider_resolution_failure_raises_valueerror(self, mock_resolve):
@@ -1628,9 +1632,9 @@ class TestDelegateHeartbeat(unittest.TestCase):
 
         child.run_conversation.side_effect = slow_run
 
-        # At interval 0.05s, idle threshold (5 cycles) trips at ~0.25s.
-        # We should see the heartbeat stop firing well before 0.6s.
-        with patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.05):
+        with patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.05), patch(
+            "tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IDLE", 5
+        ):
             _run_single_child(
                 task_index=0,
                 goal="Test wedged child",
@@ -2165,6 +2169,21 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
         self.assertIn("depth 1", prompt)
         self.assertIn("max_spawn_depth=2", prompt)
 
+    def test_codex_orchestrator_prompt_uses_native_collaboration(self):
+        prompt = _build_child_system_prompt(
+            "Survey approaches", role="orchestrator",
+            max_spawn_depth=2, child_depth=1,
+            collaboration_backend="codex-app-server",
+        )
+        self.assertIn("Codex-Native Orchestrator Role", prompt)
+        self.assertIn("spawn_agent", prompt)
+        self.assertIn("wait_agent", prompt)
+        self.assertIn("Hermes `delegate_task` is NOT available", prompt)
+        self.assertNotIn("You have access to the `delegate_task` tool", prompt)
+        self.assertNotIn("pass role='orchestrator'", prompt)
+        self.assertIn("depth 1", prompt)
+        self.assertIn("max_spawn_depth=2", prompt)
+
     def test_orchestrator_prompt_at_depth_floor_says_children_are_leaves(self):
         """With max_spawn_depth=2 and child_depth=1, the orchestrator's
         own children would be at depth 2 (the floor) → must be leaves."""
@@ -2493,6 +2512,131 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
         _, kwargs = MockAgent.call_args
         self.assertIsNone(kwargs["fallback_model"])
+
+
+class TestCodexAppServerDelegation(unittest.TestCase):
+    def test_resolve_delegation_credentials_codex_app_server_is_not_runtime_provider(self):
+        parent = _make_mock_parent()
+        cfg = {"provider": "codex-app-server", "model": "gpt-5.3-codex-spark"}
+        with patch("hermes_cli.runtime_provider.resolve_runtime_provider") as resolve_runtime:
+            creds = _resolve_delegation_credentials(cfg, parent)
+
+        resolve_runtime.assert_not_called()
+        self.assertEqual(creds["provider"], "codex-app-server")
+        self.assertEqual(creds["model"], "gpt-5.3-codex-spark")
+        self.assertIsNone(creds["api_key"])
+        self.assertIsNone(creds["base_url"])
+
+    def test_resolve_delegation_credentials_codex_app_server_defaults_blank_model(self):
+        parent = _make_mock_parent()
+        creds = _resolve_delegation_credentials({"provider": "codex-app-server"}, parent)
+
+        self.assertEqual(creds["provider"], "codex-app-server")
+        self.assertEqual(creds["model"], "gpt-5.5")
+
+    @patch("tools.delegate_tool._run_single_child")
+    def test_delegate_task_codex_app_server_builds_native_child_not_aiagent(self, mock_run):
+        parent = _make_mock_parent()
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "codex native done",
+            "api_calls": 1,
+            "duration_seconds": 1.0,
+        }
+
+        with patch("tools.delegate_tool._load_config", return_value={"provider": "codex-app-server", "model": "gpt-5.3-codex-spark", "reasoning_effort": "high"}), \
+             patch("run_agent.AIAgent") as MockAgent:
+            result = json.loads(delegate_task(goal="Use Codex native harness", parent_agent=parent))
+
+        MockAgent.assert_not_called()
+        self.assertEqual(result["results"][0]["summary"], "codex native done")
+        child = mock_run.call_args.kwargs.get("child") or mock_run.call_args.args[2]
+        from agent.codex_app_server_client import CodexAppServerSubagent
+
+        self.assertIsInstance(child, CodexAppServerSubagent)
+        self.assertEqual(child.model, "gpt-5.3-codex-spark")
+        self.assertEqual(child.reasoning_effort, "high")
+        self.assertEqual(child.role, "leaf")
+
+    def test_codex_app_server_command_override_stays_native_child(self):
+        parent = _make_mock_parent()
+        with patch("run_agent.AIAgent") as MockAgent:
+            child = _build_child_agent(
+                task_index=0,
+                goal="test codex app-server launch command",
+                context=None,
+                toolsets=None,
+                model="gpt-5.3-codex-spark",
+                max_iterations=10,
+                task_count=1,
+                parent_agent=parent,
+                override_provider="codex-app-server",
+                override_acp_command="codex",
+                override_acp_args=["app-server", "--listen", "stdio://"],
+            )
+
+        MockAgent.assert_not_called()
+        from agent.codex_app_server_client import CodexAppServerSubagent
+
+        self.assertIsInstance(child, CodexAppServerSubagent)
+        self.assertEqual(child.command, "codex")
+        self.assertEqual(child.args, ["app-server", "--listen", "stdio://"])
+        self.assertEqual(child.reasoning_effort, "low")
+
+    def test_codex_app_server_orchestrator_defaults_to_hermes_control_plane(self):
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["terminal", "file"]
+        mock_child = _make_role_mock_child()
+        with patch("tools.delegate_tool._load_config", return_value={"max_spawn_depth": 2}), \
+             patch("run_agent.AIAgent", return_value=mock_child) as MockAgent:
+            child = _build_child_agent(
+                task_index=0,
+                goal="coordinate nested codex workers",
+                context=None,
+                toolsets=None,
+                model="gpt-5.5",
+                max_iterations=10,
+                task_count=1,
+                parent_agent=parent,
+                role="orchestrator",
+                override_provider="codex-app-server",
+            )
+
+        self.assertIs(child, mock_child)
+        kwargs = MockAgent.call_args.kwargs
+        self.assertEqual(kwargs["provider"], parent.provider)
+        self.assertEqual(kwargs["model"], parent.model)
+        self.assertIn("delegation", kwargs["enabled_toolsets"])
+        self.assertIn("You have access to the `delegate_task` tool", kwargs["ephemeral_system_prompt"])
+        self.assertNotIn("spawn_agent", kwargs["ephemeral_system_prompt"])
+
+    def test_codex_app_server_orchestrator_native_spawn_tools_when_experimental_flag_enabled(self):
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["terminal", "file"]
+        with patch("tools.delegate_tool._load_config", return_value={"max_spawn_depth": 2, "codex_native_orchestrators": True}), \
+             patch("run_agent.AIAgent") as MockAgent:
+            child = _build_child_agent(
+                task_index=0,
+                goal="coordinate nested codex workers",
+                context=None,
+                toolsets=None,
+                model="gpt-5.5",
+                max_iterations=10,
+                task_count=1,
+                parent_agent=parent,
+                role="orchestrator",
+                override_provider="codex-app-server",
+            )
+
+        MockAgent.assert_not_called()
+        from agent.codex_app_server_client import CodexAppServerSubagent
+
+        self.assertIsInstance(child, CodexAppServerSubagent)
+        self.assertEqual(child.role, "orchestrator")
+        self.assertIn("spawn_agent", child.context)
+        self.assertIn("Hermes `delegate_task` is NOT available", child.context)
+        self.assertNotIn("You have access to the `delegate_task` tool", child.context)
 
 
 if __name__ == "__main__":
